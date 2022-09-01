@@ -1,0 +1,203 @@
+---
+title: "Cost Effectiveness Acceptability Curve"
+author: "Ben B"
+date: "8/15/2022"
+output: html_document
+---
+
+
+### PSA Overview
+
+- We conduct a **Probabilistic Sensitivity Analysis** because we do not know the true value of input parameters. We have estimates, but estimates alone do not account for uncertainty.
+-  Instead, we might have some level of certainty (C.I., expert opinion) that a parameter falls within a particular **range**. 
+- To reflect this uncertainty, we can use a sample from the range of plausible values for each run of the model instead of a repeatedly using a single point estimate.
+- A CEAC is a plot of the probability of each strategy being cost effective. This reflects the fact that sometimes (due monte-carlo and input uncertainty) the strategy which is most cost effective changes from run to run.
+- This document starts with the formatted output of a PSA and walks through the process
+of creating a cost effectiveness acceptability curve.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+
+# Not needed for RMD, but needed in R scripts
+# sets working directory to script location
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+psa_df <- read.csv("../practice_data/psa_example_output.csv")
+
+colnames(psa_df)    <- c("strategy",
+                  "psa_run_num",
+                  "run_id",
+                  "avg_lifespan",
+                  "avg_cost",
+                  "avg_disc_cost",
+                  "avg_qaly_min",
+                  "avg_disc_qaly_min",
+                  "avg_qaly_mult",
+                  "avg_disc_qaly_mult",
+                  "num_hcv_inf",
+                  "num_hcv_ident",
+                  "num_SVR_cases",
+                  "num_cirr",
+                  "num_liver_deaths")
+
+```
+
+### Structure of PSA Output
+
+- Getting the output from the PSA runs into the correct form is half the battle when it comes to constructing a cost effectiveness acceptability curve. Currently, our programmer does this portion.
+
+- For HEP-CE, we draw the inputs from distributions, then run several strategies with those inputs for comparison. This is repeated 1000 times.
+
+- This means we should have **(number of strategies) x (number of PSA draws) ** rows in the final output. Lets look at the first 10 rows of our example output:
+
+```{r cars}
+# the %>% operator uses the object on the left as the first argument
+# in the function on the right
+
+# arrange simply sorts the dataset by psa_run_number
+psa_df <- psa_df %>% arrange(psa_run_num)
+
+ 
+# select just the relevant columns
+head(psa_df[,c(1:2,6,10)], 10)
+```
+
+- Note: For each psa draw (psa_run_num) we run 5 strategies. That means we should have (5 strategies) x (1000 PSA draws) = 5000 rows in our dataset. This is important to keep track of!
+
+
+### CEAC Concept
+
+- Assuming each QALY is "worth" a certain number of dollars, **Net Monetary Benefit** is the amount of money gained from implementing particular strategy.
+
+- NMB = (QALY)*(WTP Threshold) - Cost, where WTP threshold is how much a QALY is "worth."
+
+- **Main Idea:** Fix a willingness to pay threshold at some dollar value. Calculate NMB for all 5000 rows. Then, group by PSA run number and choose the strategy that had the maximum NMB. Remember, each PSA run number corresponds to 5 strategy runs.
+- If we select just those rows with the maximum NMB, we will have a dataframe of 1000 "winning" strategies. The proportion (out of 1000) of time each strategy wins get plotted as points on the y-axis of a graph, with the corresponding WTP threshold on the x-axis.
+- Using a loop, we repeat the above two steps for a sequence of WTP thresholds.
+
+
+### Implementation
+
+- First, lets initialize some parameters.
+
+```{r, echo = TRUE}
+# keep track of number of runs and strategies
+num_runs <- 1000
+num_strats <- 5
+wtp_block_size <- num_runs*num_strats
+
+
+# create a sequence of willingness to pay thresholds
+# The length of this sequence will be the number of points that get graphed
+# Fewer points means faster code but choppier graph
+wtp <- seq(from = 0, to = 500000, length.out = 50)
+
+
+# initialize an empty data frame to store results in
+# we want an empty data frame with a 5000 row block for each wtp threshold
+# and we will store 4 values for each row of each block
+df_out <- as.data.frame(matrix(nrow = wtp_block_size*length(wtp), ncol=4))
+
+```
+
+
+- We will keep track of strategy, psa_run_num, net monetary benefit, and the willingness to pay threshold used to calculate nmb. These are all the components needed for our graph.
+
+- Next, we will "fill in" our empty dataframe initialized above. It will consist of 5000 row blocks, each block using a different WTP threshold to calculate NMB.
+
+```{r, echo = TRUE}
+
+# for each willingness to pay threshold
+# calculate the net monetary benefit of of each strategy-psa_run_num combo
+# and store results in the above data frame called df_out
+
+for (i in 1:length(wtp)){
+  
+  # new_df is just a temporary psa_df that holds each iterations results
+  # nmb and wtp values will be overwritten with new values each iteration
+  new_df <- psa_df %>% mutate(nmb = wtp[i]*avg_disc_qaly_mult - avg_disc_cost,
+                              wtp = wtp[i]) %>%
+                                select(strategy, psa_run_num, nmb, wtp)
+  
+  # add a "block" of 5000 rows each iteration
+  # as i ticks up from 1 to N, this loop stores the results in the ith block of 5000
+  new_rows <- (5000*(i-1) + 1):(5000*i)
+  df_out[new_rows,] <- new_df
+}
+
+colnames(df_out) <- colnames(new_df)
+
+```
+
+Here is what our new "filled in" output looks like:
+
+```{r, echo = TRUE}
+tail(df_out, 10)
+```
+
+- Within each PSA run number, there should be 5 strategies that were run, each with a NMB calculated (qaly*wtp - cost).
+
+- We can use a grouped slice_max function to extract only our winning (largest NMB) strategies.
+
+
+```{r, echo = TRUE}
+
+# for each psa_run_num and wtp threshold, find the strategy (row),
+# with the largest net monetary benefit
+# store these winning stratgies as a dataframe called winners
+
+winners <- df_out %>% group_by(psa_run_num, wtp) %>% slice_max(nmb)
+
+
+# calculate the proportion of the time each strategy wins
+# for each wtp threshold, there should be 1000 winning runs total
+winner_props <- winners %>% group_by(wtp) %>%
+  summarize(strat1 = sum(strategy == 1)/num_runs,
+            strat2 = sum(strategy == 2)/num_runs,
+            strat3 = sum(strategy == 3)/num_runs,
+            strat4 = sum(strategy == 4)/num_runs,
+            strat5 = sum(strategy == 5)/num_runs)
+
+# The final step is to create a fancy ggplot graph.
+# To do this, we need to convert our output into "long" format. 
+# The following takes the column names from cols 2-6
+# and creates a new categorical variable with them, 
+# and makes their current values a new "proportion" variable
+winners_long <- winner_props %>% pivot_longer(cols = 2:(num_strats+1), names_to = "strategy", values_to = "proportion" )
+
+```
+
+### Graphing
+
+```{r, echo = TRUE}
+
+# create base plot
+ceac_graph <- winners_long %>% ggplot(aes(x=wtp, y = proportion, color = strategy)) + geom_line()
+
+# add legend, labels and formats
+ceac_graph + scale_color_discrete(name = "HCV Screening Strategy", labels = c("Never", "One-Time", "Every 2 Years", "Every 1 Year", "Every 6 Months")) +
+  labs(title = "Cost Effectiveness Acceptability Curve",
+       x = "Willingness to Pay Threshold ($)",
+       y = "Probability of Cost Effectiveness") +
+  scale_x_continuous(labels = scales::dollar)
+
+```
+
+
+- Finally, lets do a simple check to make sure our proportions of winners sum to 1.
+
+```{r, echo = TRUE}
+
+total_checks_df <- winners_long %>% group_by(wtp) %>% summarize(total_check = sum(proportion))
+
+# this should return true
+all(total_checks_df$total_check == 1)
+
+# 'which' is a very useful function that is used frequently
+# in the generate_init_cohort.R script
+# it takes a vector of booleans (something that returns true/false) as inputs
+# and returns the indices that return 'true'
+total_checks_df$total_check[which(total_checks_df$total_check != 1)]
+```
+
